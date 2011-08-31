@@ -157,12 +157,12 @@ sub _download {
 	my $req = HTTP::Request->new(GET => $url);
 	my $res = $self->ua->request($req);
 
-	if (!$res->is_success || $res->content =~ /(?:404 Not Found|The page your? requested does not exist)/i) {
+	if (!$res->is_success || $res->decoded_content =~ /(?:404 Not Found|The page your? requested does not exist)/i) {
 		$self->session->{$url} = 0;
 		return undef;
 	}
-	$self->session->{$url} = $res->content;
-	return $res->content;
+	$self->session->{$url} = $res->decoded_content;
+	return $res->decoded_content;
 }
 
 sub _downloadXML {
