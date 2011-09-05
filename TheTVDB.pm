@@ -13,6 +13,10 @@ use DateTime;
 use DateTime::Format::Strptime qw/strptime/;
 our $VERSION = "0.1";
 
+our $HAVEZIP = 0;
+eval {require IO::Uncompress::Unzip; $HAVEZIP = 1};
+warn "IO::Uncompress::Unzip not found, please install this perl module to save bandwidth\n" unless $HAVEZIP;
+
 class_type 'DateTime';
 subtype 'TheTVDB::DateTime' => as 'Maybe[DateTime]';
 subtype 'TheTVDB::PipedList' => as 'Maybe[ArrayRef[Str]]';
@@ -93,6 +97,13 @@ has 'mirrors' => (
 	}
 );
 
+has 'updates' => (
+	is       => 'ro',
+	isa      => 'TheTVDB::Updates',
+	lazy     => 1,
+	default  => sub {TheTVDB::Updates->new(tvdb => shift)}
+);
+
 my %seriesDetailElementMap = (
 	id            => 'id',
 	Actors        => 'actors',
@@ -132,6 +143,7 @@ my %episodeElementMap = (
 	DVD_Chapter   => 'dvdChapter',
 	SeasonNumber  => 'season',
 	seasonid      => 'seasonId',
+	seriesid      => 'seriesId',
 );
 
 
@@ -167,8 +179,17 @@ sub _download {
 
 sub _downloadXML {
 	my ($self, $what, $usemirror) = @_;
+
+	$what =~ s/xml$/zip/ if $HAVEZIP && $what =~ /(updates|all)\/.*\.xml$/;
+
 	my $xml = $self->_download($what, $usemirror);
 	return undef unless $xml;
+
+	if ($what =~ /zip$/) {
+		my $zip = new IO::Uncompress::Unzip \$xml, MultiStream => 1, Transparent => 1 or die "IO::Uncompress::Unzip failed: $what\n";
+		local $/ = undef;
+		$xml = <$zip>;
+	}
 
 	return XMLin($xml, SuppressEmpty => undef);
 }
@@ -239,21 +260,21 @@ sub getEpisode {
 	}
 	elsif (defined $args{episode}) {
 		return $args{episode} if ref $args{episode} eq 'TheTVDB::Series::Episode';
-		$middleBit = 'episode/' . $args{episode};
+		$middleBit = 'episodes/' . $args{episode};
 	}
 	else {
 		return undef;
 	}
 
 	my $episodeXML = $self->_downloadXML($middleBit . '/' . $self->language . '.xml');
-	$series = $self->getSeries($episodeXML->{Episode}->{seriesid}) unless $series;
 
 	%args = ();
 	while (my ($xml, $local) = each (%episodeElementMap)) {
 		$args{$local} = $episodeXML->{Episode}->{$xml} if defined $episodeXML->{Episode}->{$xml};
 	}
+	$args{seriesId} = $series->id if $series;
 
-	return new TheTVDB::Series::Episode(tvdb => $self, series => $series, %args);
+	return new TheTVDB::Series::Episode(tvdb => $self, %args);
 }
 
 
@@ -264,6 +285,136 @@ has 'tvdb'    => (
 	is       => 'ro',
 	isa      => 'TheTVDB',
 	required => 1,
+);
+
+package TheTVDB::Updates;
+use Moose;
+extends 'TheTVDB::Base';
+
+has 'day'     => (
+	is      => 'ro',
+	isa     => 'TheTVDB::Updates::List',
+	lazy    => 1,
+	default => sub {shift->_get_updates('day')}
+);
+
+has 'week'   => (
+	is      => 'ro',
+	isa     => 'TheTVDB::Updates::List',
+	lazy    => 1,
+	default => sub {shift->_get_updates('week')}
+);
+
+has 'week'   => (
+	is      => 'ro',
+	isa     => 'TheTVDB::Updates::List',
+	lazy    => 1,
+	default => sub {shift->_get_updates('month')}
+);
+
+
+sub _get_updates {
+	my $tvdb = shift->tvdb;
+	my $period = shift;
+	my $updates = $tvdb->_downloadXML("/updates/updates_$period.xml");
+
+	# Fix single depth series/episode result
+	$updates->{Series}  = {$updates->{Series}->{id} => $updates->{Series}} if $updates->{Series}->{id};
+	$updates->{Episode} = {$updates->{Episode}->{id} => $updates->{Episode}} if $updates->{Episode}->{id};
+
+	my @series = map {
+		TheTVDB::Update::Series->new(
+			tvdb => $tvdb,
+			id   => $_,
+			time => $updates->{Series}->{$_}->{time}
+		)
+	} keys %{$updates->{Series}};
+
+	my @episode = map {
+		my $o = $updates->{Episode}->{$_};
+		TheTVDB::Update::Episode->new(
+			tvdb => $tvdb,
+			id   => $_,
+			seriesId => $o->{Series},
+			time => $o->{time}
+		)
+	} keys %{$updates->{Episode}};
+
+	return TheTVDB::Updates::List->new(tvdb => $tvdb, series => \@series, episode => \@episode);
+}
+
+package TheTVDB::Updates::List;
+use Moose;
+extends 'TheTVDB::Base';
+
+has 'series'     => (
+	is         => 'ro',
+	isa        => 'ArrayRef[TheTVDB::Update::Series]'
+);
+
+has 'episode'    => (
+	is         => 'ro',
+	isa        => 'ArrayRef[TheTVDB::Update::Episode]'
+);
+
+package TheTVDB::Update;
+use Moose;
+extends 'TheTVDB::Base';
+
+has 'id'         => (
+	is         => 'ro',
+	isa        => 'Int',
+	required   => 1
+);
+
+has 'time'       => (
+	is         => 'ro',
+	isa        => 'TheTVDB::DateTime',
+	coerce     => 1
+);
+
+package TheTVDB::Update::Series;
+use Moose;
+extends 'TheTVDB::Update';
+
+has 'detail'       => (
+	is       => 'ro',
+	isa      => 'TheTVDB::SeriesDetail',
+	lazy     => 1,
+	default  => sub {
+		my $self = shift;
+		return $self->tvdb->getSeries($self->id);
+	}
+);
+
+package TheTVDB::Update::Episode;
+use Moose;
+extends 'TheTVDB::Update';
+
+has 'series'       => (
+	is       => 'ro',
+	isa      => 'TheTVDB::SeriesDetail',
+	lazy     => 1,
+	default  => sub {
+		my $self = shift;
+		return $self->tvdb->getSeries($self->seriesId);
+	}
+);
+
+has 'seriesId'     => (
+	is       => 'ro',
+	isa      => 'Int',
+	required => 1,
+);
+
+has 'detail'       => (
+	is       => 'ro',
+	isa      => 'TheTVDB::Series::Episode',
+	lazy     => 1,
+	default  => sub {
+		my $self = shift;
+		return $self->tvdb->getEpisode(episode => $self->id);
+	}
 );
 
 package TheTVDB::Mirror;
@@ -469,10 +620,20 @@ package TheTVDB::Series::Episode;
 use Moose;
 extends 'TheTVDB::DetailBase';
 
+has 'seriesId'     => (
+	is       => 'ro',
+	isa      => 'Int',
+	required => 1
+);
+
 has 'series'       => (
 	is       => 'ro',
 	isa      => 'TheTVDB::SeriesDetail',
-	required => 1,
+	lazy     => 1,
+	default  => sub {
+		my $self = shift;
+		$self->tvdb->getSeries($self->seriesId);
+	}
 );
 
 has 'seasonId'     => (
