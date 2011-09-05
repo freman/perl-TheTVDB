@@ -2,6 +2,8 @@
 #
 # Copyright 2011 - Shannon Wynter (http://fremnet.net)
 # This code is released under GPL3
+
+# TODO: If seasons for a series has been called, look there rather than fetching again for episodes
 package TheTVDB;
 
 use Moose;
@@ -30,6 +32,13 @@ coerce 'TheTVDB::DateTime'
 coerce 'TheTVDB::PipedList'
 	=> from 'Str'
 		=> via {$_ =~ s/^\||\|$//sg; [split(/\|/, $_)]};
+
+has 'tvdb'     => (
+	is       => 'ro',
+	isa      => 'TheTVDB',
+	lazy     => 1,
+	default  => sub {shift}
+);
 
 has 'site'     => (
 	is       => 'ro',
@@ -186,7 +195,15 @@ sub _downloadXML {
 	return undef unless $xml;
 
 	if ($what =~ /zip$/) {
-		my $zip = new IO::Uncompress::Unzip \$xml, MultiStream => 1, Transparent => 1 or die "IO::Uncompress::Unzip failed: $what\n";
+		my %options = (
+			Transparent => 1,
+		);
+
+		if ($what =~ /all/) {
+			$options{Name} = 'en.xml';
+		}
+
+		my $zip = new IO::Uncompress::Unzip \$xml, %options or die "IO::Uncompress::Unzip failed: $what\n";
 		local $/ = undef;
 		$xml = <$zip>;
 	}
@@ -417,6 +434,34 @@ has 'detail'       => (
 	}
 );
 
+package TheTVDB::Season;
+use Moose;
+extends 'TheTVDB::Base';
+
+has 'season'         => (
+	is       => 'ro',
+	isa      => 'Int',
+	required => 1,
+);
+
+has 'episodes'       => (
+	is       => 'ro',
+	isa      => 'HashRef[TheTVDB::Series::Episode]',
+	required => 1
+);
+
+has 'episodeCount'   => (
+	is       => 'ro',
+	isa      => 'Int',
+	lazy     => 1,
+	default  => sub {scalar keys(%{shift->episodes})}
+);
+
+sub getEpisode {
+	my ($self, $episode) = @_;
+	return $self->episodes->{$episode};
+}
+
 package TheTVDB::Mirror;
 use Moose;
 extends 'TheTVDB::Base';
@@ -496,6 +541,8 @@ has 'detail'     => (
 		$self->tvdb->getSeries($self);
 	}
 );
+
+
 
 sub getEpisode {
 	my $self = shift;
@@ -610,6 +657,48 @@ has 'detail'        => (
 	lazy     => 1,
 	default  => sub {shift}
 );
+
+has 'seasons' => (
+	is       => 'ro',
+	isa      => 'HashRef[TheTVDB::Season]',
+	lazy     => 1,
+	default  => sub {
+		my $self = shift;
+
+		my $allXML = $self->tvdb->_downloadXML('/series/' . $self->id . '/all/en.xml');
+		$allXML->{Episode} = {$allXML->{Episode}->{id} => $allXML->{Episode}} if $allXML->{Episode}->{id};
+
+		my %seasons = ();
+		foreach my $episodeID (keys %{$allXML->{Episode}}) {
+			my $episodeXML = $allXML->{Episode}->{$episodeID};
+			my %args = ();
+			while (my ($xml, $local) = each (%episodeElementMap)) {
+				$args{$local} = $episodeXML->{$xml} if defined $episodeXML->{$xml};
+			}
+			$args{id}       = $episodeID;
+			$args{seriesId} = $self->id;
+			$args{series}   = $self;
+
+			$seasons{$episodeXML->{SeasonNumber}} //= {};
+			$seasons{$episodeXML->{SeasonNumber}}->{$episodeXML->{EpisodeNumber}} = new TheTVDB::Series::Episode(tvdb => $self->tvdb, %args);
+		}
+
+
+		return {map {($_ => TheTVDB::Season->new(tvdb => $self->tvdb, season => $_, episodes => $seasons{$_}))} keys %seasons};
+	}
+);
+
+has 'seasonCount' => (
+	is       => 'ro',
+	isa      => 'Int',
+	lazy     => 1,
+	default  => sub {scalar keys(%{shift->seasons})}
+);
+
+sub getSeason {
+	my ($self, $season) = @_;
+	return $self->seasons->{$season};
+}
 
 sub getEpisode {
 	my $self = shift;
